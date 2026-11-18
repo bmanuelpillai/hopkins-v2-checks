@@ -1,0 +1,209 @@
+---
+title: "Hopkins v2 county MMR data: comparisons behind our questions"
+subtitle: "Wisconsin, Kentucky, Indiana and Idaho"
+author: "Bevin Manuelpillai, Emory University"
+date: 2026-11-18
+format:
+  html:
+    code-fold: true
+    code-summary: "Show code"
+    code-tools: true
+    toc: true
+    toc-depth: 2
+    embed-resources: true
+    theme: cosmo
+execute:
+  warning: false
+  message: false
+---
+
+This code that reproduces the comparisons in the email. Each section compares the v2 county values with an independent source: the Wisconsin Department of Health Services (DHS) county file, or CDC SchoolVaxView state estimates.
+
+```{r}
+#| label: setup
+library(tidyverse)
+library(knitr)
+
+# Every input is read by URL, so the note renders anywhere with internet access.
+# Small files we host: github.com/bmanuelpillai/hopkins-v2-checks (data/).
+data_url <- \(file) paste0("https://raw.githubusercontent.com/bmanuelpillai/hopkins-v2-checks/main/data/", file)
+
+# Johns Hopkins county MMR data, v2 release (enshengdong/MMR_data at commit 219427a3).
+# Values are proportions; a trailing "*" marks values Hopkins flags as not comparable.
+hopkins <- read_csv("https://raw.githubusercontent.com/enshengdong/MMR_data/219427a3/mmr_data_us_counties_v2.csv",
+                    col_types = cols(.default = "c"), show_col_types = FALSE) |>
+  pivot_longer(starts_with("SY"), names_to = "school_year", values_to = "raw") |>
+  mutate(fips = str_pad(FIPS, 5, pad = "0"),
+         school_year = str_replace(str_remove(school_year, "^SY"), "_", "-"),
+         v2 = 100 * suppressWarnings(as.numeric(str_remove(raw, "\\*$")))) |>
+  filter(!is.na(v2)) |>
+  select(fips, county = County, state = State, school_year, v2)
+
+# CDC SchoolVaxView kindergarten MMR (dataset ijqb-a7ye), one estimate per state and year.
+# Snapshot of 2026-11-07, so the numbers match our email even if CDC revises the series.
+cdc <- read_csv(data_url("cdc_schoolvaxview_kindergarten_mmr.csv"),
+                show_col_types = FALSE) |>
+  transmute(state_name = geography, school_year = year_season,
+            cdc = suppressWarnings(as.numeric(coverage_estimate)),  # "NR" = not reported
+            survey_type, foot_notes)
+
+# Kindergarten enrollment by county: NCES CCD public grade-0 count plus PSS private
+# kindergarten count weighted by PFNLWT, assigned to counties by school location.
+enrollment <- read_csv(data_url("kindergarten_enrollment_county.csv"),
+                       col_types = cols(fips = "c"), show_col_types = FALSE) |>
+  select(fips, school_year, nces_k)
+
+state_means <- function(st, st_name) {
+  hopkins |>
+    filter(state == st) |>
+    left_join(enrollment, by = c("fips", "school_year")) |>
+    summarise(counties = n(), weighted_mean = weighted.mean(v2, nces_k, na.rm = TRUE),
+              unweighted_mean = mean(v2), median_county = median(v2), .by = school_year) |>
+    left_join(filter(cdc, state_name == st_name), by = "school_year") |>
+    mutate(v2_minus_cdc = weighted_mean - cdc)
+}
+num <- \(x) round(x, 1)
+```
+
+## 1. Wisconsin: which DHS series does v2 follow?
+
+The v2 notes describe Wisconsin as two-dose MMR. DHS publishes kindergarten coverage by county for all required vaccines in every year, and for MMR from 2023-24. A county value that is an all-required rate should equal the DHS all-required series. From 2023-24 it should also sit at or below the DHS MMR rate, because an all-required rate counts MMR plus other vaccines.
+
+```{r}
+#| label: wisconsin
+# DHS publishes high values as ">95"; v2 caps the same counties at 95, so ">95" is read as 95 here.
+pct <- \(x) 100 * if_else(x == ">95", 0.95, suppressWarnings(as.numeric(x)))
+dhs <- read_csv(data_url("wisconsin_dhs_kindergarten_county.csv"),
+                col_types = cols(.default = "c"), show_col_types = FALSE) |>
+  transmute(county = str_replace(str_remove(county, " County$"), "^Saint ", "St "),  # v2 writes "St Croix"
+            school_year, dhs_all_required = pct(all_required_pct), dhs_mmr = pct(mmr_pct))
+
+wi <- hopkins |>
+  filter(state == "WI") |>
+  mutate(county = str_remove(county, " County$")) |>
+  inner_join(dhs, by = c("county", "school_year")) |>
+  mutate(dhs_compared = if_else(is.na(dhs_mmr), dhs_all_required, dhs_mmr),
+         series = if_else(is.na(dhs_mmr), "All required", "Kindergarten MMR"),
+         diff = v2 - dhs_compared)
+
+wi |>
+  summarise(counties = n(), equal = sum(abs(diff) < 0.05), v2_below = sum(diff < -0.05),
+            v2_above = sum(diff > 0.05), median_diff = median(diff),
+            .by = c(school_year, series)) |>
+  kable(col.names = c("School year", "DHS series compared", "Counties", "Equal",
+                      "v2 below DHS", "v2 above DHS", "Median v2 − DHS (points)"))
+```
+
+From 2018-19 to 2020-21 the v2 values equal the DHS all-required series in every county. In 2021-22 and 2022-23 they equal it in all but 3 and 5 counties. Those few are far lower in v2:
+
+```{r}
+#| label: wisconsin-outliers
+wi |>
+  filter(series == "All required", abs(diff) >= 0.05) |>
+  select(school_year, county, v2, dhs_all_required, diff) |>
+  arrange(school_year, county) |>
+  kable(col.names = c("School year", "County", "v2", "DHS all required", "Difference"))
+```
+
+When DHS begins publishing MMR in 2023-24, v2 sits below it in most counties, as an all-required rate should:
+
+```{r}
+#| label: wisconsin-figure
+#| fig-width: 8
+#| fig-height: 3.6
+wi |>
+  filter(series == "Kindergarten MMR") |>
+  ggplot(aes(diff)) +
+  geom_histogram(binwidth = 1, fill = "#2f5d7c", colour = "white") +
+  geom_vline(xintercept = 0, linetype = 2) +
+  facet_wrap(~school_year) +
+  coord_cartesian(xlim = c(-12, 6)) +
+  labs(x = "v2 minus DHS kindergarten MMR (points)", y = "Counties",
+       caption = "Counties beyond the axis range are not shown.") +
+  theme_minimal(base_size = 12)
+```
+
+Statewide, the enrollment-weighted v2 mean matches CDC's all-required estimate in 2021-22 and runs about 3 points below CDC's MMR estimate afterwards:
+
+```{r}
+#| label: wisconsin-cdc
+state_means("WI", "Wisconsin") |>
+  filter(school_year >= "2021-22") |>
+  transmute(school_year, weighted_mean = num(weighted_mean), cdc,
+            foot_notes, v2_minus_cdc = num(v2_minus_cdc)) |>
+  kable(col.names = c("School year", "v2 weighted mean", "CDC", "CDC footnotes", "v2 − CDC"))
+```
+
+CDC's "≥" footnote marks an estimate that counts children up to date on all required vaccines.
+
+## 2. Kentucky: v2 tracks CDC, including its measure
+
+CDC publishes one kindergarten MMR estimate per state and year. For Kentucky in 2021-22 to 2023-24 it carries the "≥" footnote, so those estimates are all-required rates. The v2 values, labelled MMR, average to within 0.1 point of CDC from 2022-23 on, both while CDC is all-required and after it switches to MMR in 2024-25.
+
+```{r}
+#| label: kentucky
+state_means("KY", "Kentucky") |>
+  filter(school_year >= "2021-22") |>
+  transmute(school_year, counties, weighted_mean = num(weighted_mean),
+            unweighted_mean = num(unweighted_mean), cdc, foot_notes,
+            v2_minus_cdc = num(v2_minus_cdc)) |>
+  kable(col.names = c("School year", "Counties", "v2 weighted mean", "Unweighted",
+                      "CDC", "CDC footnotes", "v2 − CDC"))
+```
+
+## 3. Indiana: 2023-24 stands apart
+
+In 2023-24 the v2 values sit about 3.6 points above CDC; in 2024-25 they agree. Weighting does not explain the gap: the unweighted mean and the median county are higher still.
+
+```{r}
+#| label: indiana
+state_means("IN", "Indiana") |>
+  filter(school_year >= "2021-22") |>
+  transmute(school_year, counties, weighted_mean = num(weighted_mean),
+            unweighted_mean = num(unweighted_mean), median_county = num(median_county),
+            cdc, v2_minus_cdc = num(v2_minus_cdc)) |>
+  kable(col.names = c("School year", "Counties", "v2 weighted mean", "Unweighted",
+                      "Median county", "CDC", "v2 − CDC"))
+```
+
+The drop from 2023-24 to 2024-25 is broad, not a few counties:
+
+```{r}
+#| label: indiana-change
+#| fig-width: 6
+#| fig-height: 3.4
+ind <- hopkins |>
+  filter(state == "IN", school_year %in% c("2023-24", "2024-25")) |>
+  select(fips, school_year, v2) |>
+  pivot_wider(names_from = school_year, values_from = v2) |>
+  mutate(change = `2024-25` - `2023-24`)
+
+ggplot(ind, aes(change)) +
+  geom_histogram(binwidth = 1, fill = "#2f5d7c", colour = "white") +
+  geom_vline(xintercept = 0, linetype = 2) +
+  labs(x = "Change from 2023-24 to 2024-25 (points)", y = "Counties") +
+  theme_minimal(base_size = 12)
+```
+
+`r sum(ind$change < 0, na.rm = TRUE)` of `r nrow(ind)` counties fall, by a median of `r num(-median(ind$change, na.rm = TRUE))` points, while CDC's estimate is unchanged at 90.8.
+
+## 4. Idaho: a widening gap above CDC
+
+```{r}
+#| label: idaho
+state_means("ID", "Idaho") |>
+  filter(school_year >= "2021-22") |>
+  transmute(school_year, counties, weighted_mean = num(weighted_mean), cdc,
+            survey_type, v2_minus_cdc = num(v2_minus_cdc)) |>
+  kable(col.names = c("School year", "Counties", "v2 weighted mean", "CDC",
+                      "CDC collection", "v2 − CDC"))
+```
+
+Both series are census-based, yet v2 runs above CDC by 1.5 to 2.7 points, and the gap grows each year.
+
+## Sources
+
+- **Johns Hopkins county MMR data, v2 release:** `mmr_data_us_counties_v2.csv`, github.com/enshengdong/MMR_data at commit 219427a3.
+- **Wisconsin DHS:** kindergarten immunization assessment by county, `p01892.xlsx` (tab "By County"), dhs.wisconsin.gov/publications/p01892.xlsx.
+- **CDC SchoolVaxView:** kindergarten MMR coverage, data.cdc.gov dataset ijqb-a7ye.
+- **Kindergarten enrollment:** NCES Common Core of Data (public schools) and Private School Survey, assigned to counties by school location.
